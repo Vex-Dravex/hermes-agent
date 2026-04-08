@@ -6509,6 +6509,21 @@ class AIAgent:
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
 
+        # Auto-capture checkpoint before compression
+        if self._session_db and messages:
+            try:
+                token_count = approx_tokens or 0
+                self._session_db.create_checkpoint(
+                    session_id=self.session_id,
+                    messages=messages,
+                    token_count=token_count,
+                    reason='auto-compression',
+                    summary=f'Auto-saved before compression ({len(messages)} messages, ~{token_count:,} tokens)'
+                )
+                logger.info('checkpoint saved before compression: session=%s messages=%d', self.session_id, len(messages))
+            except Exception as e:
+                logger.warning('failed to save pre-compression checkpoint: %s', e)
+
         # Notify external memory provider before compression discards context
         if self._memory_manager:
             try:
