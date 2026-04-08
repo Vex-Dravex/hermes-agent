@@ -4188,6 +4188,71 @@ class HermesCLI:
         _cprint(f"  Original session: {parent_session_id}")
         _cprint(f"  Branch session:   {new_session_id}")
 
+    def _handle_checkpoint_command(self):
+        """Handle /checkpoint — save current conversation state."""
+        if not self.conversation_history:
+            _cprint("  No conversation to checkpoint — send a message first.")
+            return
+        if not self._session_db:
+            _cprint("  Session database not available.")
+            return
+
+        token_count = 0
+        if hasattr(self, "context_compressor") and self.context_compressor:
+            token_count = self.context_compressor.last_prompt_tokens or 0
+
+        cp_id = self._session_db.create_checkpoint(
+            session_id=self.session_id,
+            messages=list(self.conversation_history),
+            token_count=token_count,
+            reason="manual",
+            summary=f"Manual checkpoint ({len(self.conversation_history)} messages)",
+        )
+        if cp_id:
+            _cprint(f"  ✅ Checkpoint #{cp_id} saved ({len(self.conversation_history)} messages)")
+        else:
+            _cprint("  ❌ Failed to save checkpoint")
+
+    def _handle_restore_command(self, command: str):
+        """Handle /restore [checkpoint_id] — list or restore from checkpoints."""
+        if not self._session_db:
+            _cprint("  Session database not available.")
+            return
+
+        parts = command.split(None, 1)
+        checkpoint_id = None
+        if len(parts) > 1:
+            try:
+                checkpoint_id = int(parts[1].strip())
+            except ValueError:
+                _cprint("  Usage: /restore [checkpoint_id]")
+                return
+
+        if checkpoint_id is None:
+            checkpoints = self._session_db.list_checkpoints(self.session_id)
+            if not checkpoints:
+                _cprint("  No checkpoints found for this session.")
+                _cprint("  Use /checkpoint to save one, or checkpoints are auto-saved before compression.")
+                return
+            _cprint("  📋 Checkpoints:")
+            for cp in checkpoints:
+                _cprint(f"    #{cp['id']} — {cp['reason']} — {cp.get('summary', 'no summary')} — {cp['created_at']}")
+            _cprint("\n  Use /restore <id> to restore a checkpoint")
+        else:
+            cp = self._session_db.get_checkpoint(checkpoint_id)
+            if not cp:
+                _cprint(f"  Checkpoint #{checkpoint_id} not found.")
+                return
+
+            restored_messages = cp.get("checkpoint_data", [])
+            if not restored_messages:
+                _cprint(f"  Checkpoint #{checkpoint_id} has no message data.")
+                return
+
+            self.conversation_history = restored_messages
+            _cprint(f"  ✅ Restored checkpoint #{checkpoint_id} ({len(restored_messages)} messages)")
+            _cprint(f"  Session rolled back to: {cp.get('summary', cp['reason'])}")
+
     def save_conversation(self):
         """Save the current conversation to a file."""
         if not self.conversation_history:
@@ -5034,6 +5099,10 @@ class HermesCLI:
                 self._pending_input.put(retry_msg)
         elif canonical == "undo":
             self.undo_last()
+        elif canonical == "checkpoint":
+            self._handle_checkpoint_command()
+        elif canonical == "restore":
+            self._handle_restore_command(cmd_original)
         elif canonical == "branch":
             self._handle_branch_command(cmd_original)
         elif canonical == "save":
