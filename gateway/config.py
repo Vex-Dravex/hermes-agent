@@ -937,6 +937,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 pass
         if webhook_secret:
             config.platforms[Platform.WEBHOOK].extra["secret"] = webhook_secret
+        webhook_api_secret = os.getenv("WEBHOOK_API_SECRET", "")
+        if webhook_api_secret:
+            config.platforms[Platform.WEBHOOK].extra["api_secret"] = webhook_api_secret
 
     # Feishu / Lark
     feishu_app_id = os.getenv("FEISHU_APP_ID")
