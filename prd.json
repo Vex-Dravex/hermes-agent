@@ -92,7 +92,7 @@
         "Project passes python -m py_compile hermes_cli/commands.py",
         "Project passes python -m py_compile cli.py"
       ],
-      "passes": false
+      "passes": true
     }
   ]
 }
