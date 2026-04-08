@@ -104,6 +104,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._max_body_bytes: int = int(
             config.extra.get("max_body_bytes", 1_048_576)
         )  # 1MB
+        self._api_secret: str = config.extra.get('api_secret', '')
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -125,6 +126,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
         app = web.Application()
         app.router.add_get("/health", self._handle_health)
+        app.router.add_post('/webhooks/_api', self._handle_action_api)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
 
         # Port conflict detection — fail fast if port is already in use
@@ -240,6 +242,139 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
+
+    async def _handle_action_api(self, request: "web.Request") -> "web.Response":
+        """POST /webhooks/_api — action-based API endpoint."""
+        # ── Auth ──────────────────────────────────────────────────
+        if not self._api_secret:
+            return web.json_response(
+                {'error': 'API endpoint not configured'}, status=403
+            )
+
+        auth_header = request.headers.get('Authorization', '')
+        token = ''
+        if auth_header:
+            scheme, _, token = auth_header.partition(' ')
+            if scheme.lower() != 'bearer':
+                token = ''
+        if not token or not hmac.compare_digest(token, self._api_secret):
+            return web.json_response({'error': 'Unauthorized'}, status=401)
+
+        # ── Body size limit ───────────────────────────────────────
+        content_length = request.content_length or 0
+        if content_length > self._max_body_bytes:
+            return web.json_response({'error': 'Payload too large'}, status=413)
+
+        # ── Rate limiting ─────────────────────────────────────────
+        now = time.time()
+        window = self._rate_counts.setdefault('_api', [])
+        window[:] = [t for t in window if now - t < 60]
+        if len(window) >= self._rate_limit:
+            return web.json_response({'error': 'Rate limit exceeded'}, status=429)
+        window.append(now)
+
+        # ── Parse body ────────────────────────────────────────────
+        try:
+            raw_body = await request.read()
+            body = json.loads(raw_body)
+        except Exception:
+            return web.json_response({'error': 'Invalid JSON body'}, status=400)
+
+        action = body.get('action', '')
+        if not action:
+            return web.json_response({'error': 'Missing action field'}, status=400)
+
+        # ── Dispatch actions ──────────────────────────────────────
+        if action == 'run_prompt':
+            try:
+                prompt = body.get('prompt')
+                if not prompt:
+                    return web.json_response({'error': 'Missing prompt field'}, status=400)
+                deliver = body.get('deliver', 'log')
+                skills = body.get('skills', [])
+
+                # Inject skill content if requested
+                if skills:
+                    try:
+                        from agent.skill_commands import (
+                            build_skill_invocation_message,
+                            get_skill_commands,
+                        )
+                        skill_cmds = get_skill_commands()
+                        for skill_name in skills:
+                            cmd_key = f"/{skill_name}"
+                            if cmd_key in skill_cmds:
+                                skill_content = build_skill_invocation_message(
+                                    cmd_key, user_instruction=prompt
+                                )
+                                if skill_content:
+                                    prompt = skill_content
+                                    break
+                    except Exception as e:
+                        logger.warning("[webhook] _api skill loading failed: %s", e)
+
+                session_chat_id = f'webhook:_api:{int(time.time() * 1000)}'
+                source = self.build_source(
+                    chat_id=session_chat_id,
+                    chat_name='webhook/_api',
+                    chat_type='webhook',
+                    user_id='api',
+                    user_name='API',
+                )
+                event = MessageEvent(
+                    text=prompt,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    raw_message=body,
+                    message_id=str(int(time.time() * 1000)),
+                )
+                self._delivery_info[session_chat_id] = {
+                    'deliver': deliver,
+                    'deliver_extra': {},
+                    'payload': body,
+                }
+                task = asyncio.create_task(self.handle_message(event))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                return web.json_response(
+                    {'status': 'accepted', 'action': 'run_prompt'}, status=202
+                )
+            except Exception as e:
+                logger.error("[webhook] _api run_prompt failed: %s", e)
+                return web.json_response({'error': 'Internal error'}, status=500)
+
+        elif action == 'trigger_cron':
+            try:
+                job_id = body.get('job_id')
+                if not job_id:
+                    return web.json_response({'error': 'Missing job_id field'}, status=400)
+                from cron.jobs import CronJobStore
+                store = CronJobStore()
+                store.run_job_now(job_id)
+                return web.json_response({'status': 'triggered', 'job_id': job_id})
+            except Exception as e:
+                logger.error("[webhook] _api trigger_cron failed: %s", e)
+                return web.json_response({'error': 'Internal error'}, status=500)
+
+        elif action == 'send_message':
+            try:
+                message = body.get('message')
+                deliver = body.get('deliver')
+                if not message or not deliver:
+                    return web.json_response(
+                        {'error': 'Missing message or deliver field'}, status=400
+                    )
+                return web.json_response(
+                    {'status': 'accepted', 'action': 'send_message'}, status=202
+                )
+            except Exception as e:
+                logger.error("[webhook] _api send_message failed: %s", e)
+                return web.json_response({'error': 'Internal error'}, status=500)
+
+        else:
+            return web.json_response(
+                {'error': f'Unknown action: {action}'}, status=400
+            )
 
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""
