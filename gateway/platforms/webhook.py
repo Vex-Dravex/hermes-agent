@@ -312,15 +312,19 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.error("[webhook] Failed to read body: %s", e)
             return web.json_response({"error": "Bad request"}, status=400)
 
-        # Validate HMAC signature (skip for INSECURE_NO_AUTH testing mode)
+        # Validate Bearer token or HMAC signature
+        # (skip for INSECURE_NO_AUTH testing mode)
         secret = route_config.get("secret", self._global_secret)
         if secret and secret != _INSECURE_NO_AUTH:
-            if not self._validate_signature(request, raw_body, secret):
+            if not (
+                self._validate_bearer_token(request, secret)
+                or self._validate_signature(request, raw_body, secret)
+            ):
                 logger.warning(
-                    "[webhook] Invalid signature for route %s", route_name
+                    "[webhook] Unauthorized webhook for route %s", route_name
                 )
                 return web.json_response(
-                    {"error": "Invalid signature"}, status=401
+                    {"error": "Unauthorized"}, status=401
                 )
 
         # Parse payload
@@ -479,6 +483,22 @@ class WebhookAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Signature validation
     # ------------------------------------------------------------------
+
+    def _validate_bearer_token(
+        self, request: "web.Request", secret: str
+    ) -> bool:
+        """Validate Bearer token from Authorization or X-Hermes-Token."""
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header:
+            scheme, _, token = auth_header.partition(" ")
+            if scheme.lower() == "bearer" and token:
+                return hmac.compare_digest(token, secret)
+
+        fallback_token = request.headers.get("X-Hermes-Token", "")
+        if fallback_token:
+            return hmac.compare_digest(fallback_token, secret)
+
+        return False
 
     def _validate_signature(
         self, request: "web.Request", body: bytes, secret: str
