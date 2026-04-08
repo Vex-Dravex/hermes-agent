@@ -1,0 +1,98 @@
+{
+  "projectName": "hermes-agent",
+  "branchName": "feat/openclaw-inspired-upgrades",
+  "stories": [
+    {
+      "id": 1,
+      "title": "Add Bearer token auth to webhook adapter",
+      "description": "Modify `gateway/platforms/webhook.py` to support Bearer token authentication as an alternative to HMAC signature validation. Currently the `_handle_webhook` method at line ~237 only supports HMAC via `_validate_signature()`. Add a new auth path:\n\n1. In the `_handle_webhook` method, BEFORE the HMAC validation block (around line 287), add Bearer token check:\n   - Extract token from `Authorization: Bearer <token>` header OR `X-Hermes-Token` header\n   - If a Bearer token is found, compare it against the route's `secret` field using `hmac.compare_digest()` (timing-safe comparison)\n   - If Bearer auth succeeds, skip the HMAC validation entirely\n   - If no Bearer token is found, fall through to existing HMAC validation\n\n2. Add a new helper method `_validate_bearer_token(self, request, secret: str) -> bool` that:\n   - Reads `Authorization` header, checks for `Bearer ` prefix (case-insensitive on 'Bearer')\n   - Falls back to `X-Hermes-Token` header\n   - Returns False if no token found\n   - Uses `hmac.compare_digest(token, secret)` for timing-safe comparison\n   - Returns True on match\n\n3. Modify the auth block in `_handle_webhook` to try Bearer first, then HMAC:\n   ```python\n   if secret and secret != _INSECURE_NO_AUTH:\n       if not (self._validate_bearer_token(request, secret) or self._validate_signature(request, raw_body, secret)):\n           return web.json_response({\"error\": \"Unauthorized\"}, status=401)\n   ```\n\nFiles to modify: `gateway/platforms/webhook.py`\nDo NOT modify any other files. Do NOT change the existing HMAC validation logic in `_validate_signature`.",
+      "acceptanceCriteria": [
+        "gateway/platforms/webhook.py contains a _validate_bearer_token method",
+        "The method uses hmac.compare_digest for timing-safe comparison",
+        "Bearer token is extracted from Authorization header or X-Hermes-Token header",
+        "_handle_webhook tries Bearer auth before HMAC auth",
+        "Existing HMAC validation still works as fallback",
+        "Project passes python -m py_compile gateway/platforms/webhook.py"
+      ],
+      "passes": false
+    },
+    {
+      "id": 2,
+      "title": "Add action-based API endpoint to webhook adapter",
+      "description": "Add a new HTTP endpoint `POST /webhooks/_api` to the webhook adapter in `gateway/platforms/webhook.py` that accepts action-based JSON payloads. This endpoint lets external systems trigger Catalyst actions via a simple API.\n\n1. In the `connect()` method (line ~103), add a new route BEFORE the existing `/{route_name}` route:\n   ```python\n   app.router.add_post('/webhooks/_api', self._handle_action_api)\n   ```\n\n2. Create new async method `_handle_action_api(self, request)` that:\n   a. Reads `Authorization: Bearer <token>` header\n   b. Validates against a new config field `self._api_secret` (read from `config.extra.get('api_secret', '')` in `__init__`)\n   c. If no api_secret configured, return 403 with `{\"error\": \"API endpoint not configured\"}`\n   d. If token invalid, return 401\n   e. Parses JSON body, extracts `action` field\n   f. Dispatches to action handlers based on `action` value:\n      - `\"run_prompt\"`: requires `prompt` field, optional `deliver` field (default: `\"log\"`), optional `skills` list. Creates a webhook event with the prompt and emits it via `self._emit_event(event)`. Return `{\"status\": \"accepted\", \"action\": \"run_prompt\"}`\n      - `\"trigger_cron\"`: requires `job_id` field. Imports `from cron.jobs import CronJobStore` and calls `store.run_job_now(job_id)`. Return `{\"status\": \"triggered\", \"job_id\": job_id}`\n      - `\"send_message\"`: requires `message` and `deliver` fields. Uses `self.gateway_runner` to deliver the message to the target platform. Return `{\"status\": \"sent\"}`\n      - Unknown action: return 400 with `{\"error\": f\"Unknown action: {action}\"}`\n   g. Apply rate limiting (reuse existing `_rate_counts` with key `\"_api\"`)\n   h. Apply body size limit (reuse `_max_body_bytes`)\n\n3. In `__init__`, add:\n   ```python\n   self._api_secret: str = config.extra.get('api_secret', '')\n   ```\n\n4. Use `hmac.compare_digest()` for token validation (import already exists at top of file).\n\n5. Wrap each action handler in try/except and return `{\"error\": str(e)}` with status 500 on failure.\n\nFiles to modify: `gateway/platforms/webhook.py`\nDo NOT modify any other files.",
+      "acceptanceCriteria": [
+        "gateway/platforms/webhook.py contains _handle_action_api async method",
+        "The /webhooks/_api route is registered in the connect() method",
+        "self._api_secret is read from config.extra in __init__",
+        "run_prompt action creates event and emits it",
+        "trigger_cron action imports CronJobStore and calls run_job_now",
+        "send_message action uses gateway_runner for delivery",
+        "Unknown actions return 400 error",
+        "Rate limiting and body size limits are applied",
+        "Project passes python -m py_compile gateway/platforms/webhook.py"
+      ],
+      "passes": false
+    },
+    {
+      "id": 3,
+      "title": "Create memory health scanner with contradiction detection",
+      "description": "Create a new file `tools/memory_health.py` that scans the agent's memory files for contradictions, staleness, and generates a health report. The memory files are at `~/.hermes/memory/MEMORY.md` and `~/.hermes/memory/USER.md` (resolved via `hermes_constants.get_hermes_home() / 'memory'`). Entries are separated by the delimiter `'\\n§\\n'`.\n\n1. Create `tools/memory_health.py` with these components:\n\n```python\nimport re\nimport json\nimport logging\nfrom datetime import datetime, timedelta\nfrom pathlib import Path\nfrom typing import List, Dict, Any, Tuple, Optional\nfrom hermes_constants import get_hermes_home\n\nlogger = logging.getLogger(__name__)\n\nENTRY_DELIMITER = '\\n§\\n'\nFRESH_DAYS = 30\nAGING_DAYS = 90\n```\n\n2. Class `MemoryHealthScanner`:\n   - `__init__(self)`: sets `self.memory_dir = get_hermes_home() / 'memory'`\n   - `scan(self) -> Dict[str, Any]`: main method, returns full health report dict\n   - `_load_entries(self, filename: str) -> List[str]`: reads file, splits by ENTRY_DELIMITER, strips whitespace, filters empty\n   - `_find_contradictions(self, entries: List[str]) -> List[Dict]`: finds potentially contradicting entries by:\n     a. Extract key phrases from each entry (first line or first 80 chars as the 'topic')\n     b. Compare all pairs of entries for opposing patterns:\n        - Look for negation conflicts: entry A says \"X uses Y\" and entry B says \"X does NOT use Y\" or \"X no longer uses Y\"\n        - Look for value conflicts: entry A says \"X is A\" and entry B says \"X is B\" where A != B for same X\n        - Use regex patterns: `r'(?:does not|doesn\\'t|don\\'t|NOT|no longer|never|stopped|removed|deprecated)'`\n     c. Return list of `{\"entry_a\": str, \"entry_b\": str, \"reason\": str}` for each potential conflict\n   - `_check_staleness(self, entries: List[str]) -> Dict[str, List[str]]`: returns `{\"fresh\": [...], \"aging\": [...], \"stale\": [...]}` based on entry content heuristics (look for date patterns like `YYYY-MM-DD`, `April 2026`, version numbers)\n   - `_generate_report(self, memory_entries, user_entries, contradictions_memory, contradictions_user, staleness_memory, staleness_user) -> str`: generates a markdown report string\n\n3. Standalone function `run_health_scan() -> str`:\n   - Creates scanner, runs scan, writes report to `get_hermes_home() / 'memory_health_report.md'`\n   - Returns the report as a string\n\n4. Standalone function `get_health_summary() -> Dict[str, Any]`:\n   - Returns compact dict with counts: `{\"memory_entries\": N, \"user_entries\": N, \"contradictions\": N, \"stale_entries\": N, \"aging_entries\": N}`\n\nFiles to create: `tools/memory_health.py`\nDo NOT modify any existing files.",
+      "acceptanceCriteria": [
+        "tools/memory_health.py exists and is a valid Python file",
+        "MemoryHealthScanner class exists with scan(), _load_entries(), _find_contradictions(), _check_staleness(), _generate_report() methods",
+        "run_health_scan() function writes report to memory_health_report.md",
+        "get_health_summary() function returns compact dict with counts",
+        "Uses hermes_constants.get_hermes_home() for paths (not hardcoded ~/.hermes)",
+        "Entry delimiter is '\\n§\\n' matching the existing memory tool format",
+        "Project passes python -m py_compile tools/memory_health.py"
+      ],
+      "passes": false
+    },
+    {
+      "id": 4,
+      "title": "Add session_checkpoints table and capture method to SessionDB",
+      "description": "Modify `hermes_state.py` to add a `session_checkpoints` table and methods for creating/listing/restoring conversation checkpoints.\n\n1. Add new table creation SQL after the existing `messages` table (around line 90). Add it to the `_SCHEMA` string:\n```sql\nCREATE TABLE IF NOT EXISTS session_checkpoints (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    session_id TEXT NOT NULL,\n    checkpoint_data TEXT NOT NULL,\n    token_count INTEGER,\n    reason TEXT DEFAULT 'manual',\n    summary TEXT,\n    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n    FOREIGN KEY (session_id) REFERENCES sessions(id)\n);\nCREATE INDEX IF NOT EXISTS idx_checkpoints_session ON session_checkpoints(session_id, created_at);\n```\n\n2. In the schema migration section (look for `_SCHEMA_VERSION` around line 230-340), increment the version and add migration:\n```python\nif current_version < NEW_VERSION:\n    try:\n        cursor.execute('''CREATE TABLE IF NOT EXISTS session_checkpoints (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            session_id TEXT NOT NULL,\n            checkpoint_data TEXT NOT NULL,\n            token_count INTEGER,\n            reason TEXT DEFAULT 'manual',\n            summary TEXT,\n            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n            FOREIGN KEY (session_id) REFERENCES sessions(id)\n        )''')\n        cursor.execute('CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON session_checkpoints(session_id, created_at)')\n    except Exception:\n        pass\n```\n\n3. Add these methods to the `SessionDB` class:\n\n   a. `create_checkpoint(self, session_id: str, messages: list, token_count: int = None, reason: str = 'manual', summary: str = None) -> Optional[int]`:\n      - Serializes messages to JSON via `json.dumps(messages)`\n      - Inserts into session_checkpoints\n      - Enforces max 10 checkpoints per session (delete oldest if exceeded)\n      - Returns the checkpoint id or None on failure\n\n   b. `list_checkpoints(self, session_id: str) -> List[Dict[str, Any]]`:\n      - Returns list of `{id, session_id, token_count, reason, summary, created_at}` (WITHOUT checkpoint_data for efficiency)\n      - Ordered by created_at DESC\n\n   c. `get_checkpoint(self, checkpoint_id: int) -> Optional[Dict[str, Any]]`:\n      - Returns full checkpoint including `checkpoint_data` (as parsed JSON list)\n      - Uses `json.loads()` on checkpoint_data\n\n   d. `delete_checkpoint(self, checkpoint_id: int) -> bool`:\n      - Deletes by id, returns True if deleted\n\nFiles to modify: `hermes_state.py`\nDo NOT modify any other files. The `json` module is already imported at the top of the file.",
+      "acceptanceCriteria": [
+        "hermes_state.py contains CREATE TABLE session_checkpoints SQL",
+        "Schema migration for session_checkpoints exists",
+        "SessionDB has create_checkpoint method that serializes messages to JSON",
+        "SessionDB has list_checkpoints method that returns metadata without data",
+        "SessionDB has get_checkpoint method that returns full data with parsed JSON",
+        "SessionDB has delete_checkpoint method",
+        "Max 10 checkpoints per session enforced in create_checkpoint",
+        "Project passes python -m py_compile hermes_state.py"
+      ],
+      "passes": false
+    },
+    {
+      "id": 5,
+      "title": "Auto-capture checkpoint before context compression",
+      "description": "Modify `run_agent.py` to automatically create a conversation checkpoint before context compression runs. This preserves the full conversation state so users can restore to pre-compression state.\n\nIn the `_compress_context` method (around line 5853), add checkpoint capture BEFORE the compression call:\n\n1. Find the `_compress_context` method (search for `def _compress_context`). It currently starts with logging and memory flush.\n\n2. AFTER the line `self.flush_memories(messages, min_turns=0)` and BEFORE the line `compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)`, add:\n```python\n# Auto-capture checkpoint before compression\nif self._session_db and messages:\n    try:\n        token_count = approx_tokens or 0\n        self._session_db.create_checkpoint(\n            session_id=self.session_id,\n            messages=messages,\n            token_count=token_count,\n            reason='auto-compression',\n            summary=f'Auto-saved before compression ({len(messages)} messages, ~{token_count:,} tokens)'\n        )\n        logger.info('checkpoint saved before compression: session=%s messages=%d', self.session_id, len(messages))\n    except Exception as e:\n        logger.warning('failed to save pre-compression checkpoint: %s', e)\n```\n\n3. That's it. Do NOT modify any other part of the method. Do NOT change the compression logic itself.\n\nFiles to modify: `run_agent.py`\nDo NOT modify any other files. Do NOT change any existing logic — only INSERT the checkpoint block.",
+      "acceptanceCriteria": [
+        "run_agent.py _compress_context method calls self._session_db.create_checkpoint before compression",
+        "Checkpoint is created with reason='auto-compression'",
+        "Token count is passed from approx_tokens parameter",
+        "The checkpoint creation is wrapped in try/except",
+        "Existing compression logic is unchanged",
+        "Project passes python -m py_compile run_agent.py"
+      ],
+      "passes": false
+    },
+    {
+      "id": 6,
+      "title": "Add /checkpoint and /restore slash commands",
+      "description": "Add two new slash commands to the CLI: `/checkpoint` (manually save a conversation checkpoint) and `/restore` (list and restore from checkpoints).\n\n1. In `hermes_cli/commands.py`, add two new CommandDef entries to the `COMMAND_REGISTRY` list (add them near the existing `/branch` and `/compress` entries around line 60-63):\n```python\nCommandDef(\"checkpoint\", \"Save a conversation checkpoint (snapshot of current state)\", \"Session\",\n           aliases=(\"cp\",)),\nCommandDef(\"restore\", \"List or restore from a conversation checkpoint\", \"Session\",\n           aliases=(\"rs\",), args_hint=\"[checkpoint_id]\"),\n```\n\n2. In `cli.py`, in the `process_command` method (around line 4435), add handlers for the new commands. Add these BEFORE the `elif canonical == \"branch\":` line:\n```python\nelif canonical == \"checkpoint\":\n    self._handle_checkpoint_command()\nelif canonical == \"restore\":\n    self._handle_restore_command(cmd_original)\n```\n\n3. In `cli.py`, add the handler methods to the `HermesCLI` class (add them near `_handle_branch_command` around line 3428):\n\n```python\ndef _handle_checkpoint_command(self):\n    \"\"\"Handle /checkpoint — save current conversation state.\"\"\"\n    if not self.conversation_history:\n        _cprint(\"  No conversation to checkpoint — send a message first.\")\n        return\n    if not self._session_db:\n        _cprint(\"  Session database not available.\")\n        return\n    \n    token_count = 0\n    if hasattr(self, 'context_compressor') and self.context_compressor:\n        token_count = self.context_compressor.last_prompt_tokens or 0\n    \n    cp_id = self._session_db.create_checkpoint(\n        session_id=self.session_id,\n        messages=list(self.conversation_history),\n        token_count=token_count,\n        reason='manual',\n        summary=f'Manual checkpoint ({len(self.conversation_history)} messages)'\n    )\n    if cp_id:\n        _cprint(f\"  ✅ Checkpoint #{cp_id} saved ({len(self.conversation_history)} messages)\")\n    else:\n        _cprint(\"  ❌ Failed to save checkpoint\")\n\ndef _handle_restore_command(self, command: str):\n    \"\"\"Handle /restore [checkpoint_id] — list or restore from checkpoints.\"\"\"\n    if not self._session_db:\n        _cprint(\"  Session database not available.\")\n        return\n    \n    parts = command.split(None, 1)\n    checkpoint_id = None\n    if len(parts) > 1:\n        try:\n            checkpoint_id = int(parts[1].strip())\n        except ValueError:\n            _cprint(\"  Usage: /restore [checkpoint_id]\")\n            return\n    \n    if checkpoint_id is None:\n        # List checkpoints\n        checkpoints = self._session_db.list_checkpoints(self.session_id)\n        if not checkpoints:\n            _cprint(\"  No checkpoints found for this session.\")\n            _cprint(\"  Use /checkpoint to save one, or checkpoints are auto-saved before compression.\")\n            return\n        _cprint(\"  📋 Checkpoints:\")\n        for cp in checkpoints:\n            _cprint(f\"    #{cp['id']} — {cp['reason']} — {cp.get('summary', 'no summary')} — {cp['created_at']}\")\n        _cprint(f\"\\n  Use /restore <id> to restore a checkpoint\")\n    else:\n        # Restore checkpoint\n        cp = self._session_db.get_checkpoint(checkpoint_id)\n        if not cp:\n            _cprint(f\"  Checkpoint #{checkpoint_id} not found.\")\n            return\n        \n        restored_messages = cp.get('checkpoint_data', [])\n        if not restored_messages:\n            _cprint(f\"  Checkpoint #{checkpoint_id} has no message data.\")\n            return\n        \n        self.conversation_history = restored_messages\n        _cprint(f\"  ✅ Restored checkpoint #{checkpoint_id} ({len(restored_messages)} messages)\")\n        _cprint(f\"  Session rolled back to: {cp.get('summary', cp['reason'])}\")\n```\n\nNote: `_cprint` is already defined in cli.py as a helper for printing to console. `self.conversation_history` is the live message list. `self._session_db` is the SessionDB instance. `self.session_id` is the current session ID string.\n\nFiles to modify: `hermes_cli/commands.py`, `cli.py`\nDo NOT modify any other files.",
+      "acceptanceCriteria": [
+        "hermes_cli/commands.py has CommandDef entries for 'checkpoint' and 'restore'",
+        "cli.py process_command dispatches to _handle_checkpoint_command and _handle_restore_command",
+        "cli.py has _handle_checkpoint_command method that calls create_checkpoint",
+        "cli.py has _handle_restore_command method that lists or restores checkpoints",
+        "/restore with no args lists all checkpoints for current session",
+        "/restore <id> loads checkpoint data and replaces conversation_history",
+        "Project passes python -m py_compile hermes_cli/commands.py",
+        "Project passes python -m py_compile cli.py"
+      ],
+      "passes": false
+    }
+  ]
+}
