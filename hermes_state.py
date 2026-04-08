@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -84,10 +84,22 @@ CREATE TABLE IF NOT EXISTS messages (
     codex_reasoning_items TEXT
 );
 
+CREATE TABLE IF NOT EXISTS session_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    checkpoint_data TEXT NOT NULL,
+    token_count INTEGER,
+    reason TEXT DEFAULT 'manual',
+    summary TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON session_checkpoints(session_id, created_at);
 """
 
 FTS_SQL = """
@@ -329,6 +341,22 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                try:
+                    cursor.execute('''CREATE TABLE IF NOT EXISTS session_checkpoints (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        checkpoint_data TEXT NOT NULL,
+                        token_count INTEGER,
+                        reason TEXT DEFAULT 'manual',
+                        summary TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (session_id) REFERENCES sessions(id)
+                    )''')
+                    cursor.execute('CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON session_checkpoints(session_id, created_at)')
+                except Exception:
+                    pass
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -929,6 +957,85 @@ class SessionDB:
                         msg["codex_reasoning_items"] = None
             messages.append(msg)
         return messages
+
+    def create_checkpoint(
+        self,
+        session_id: str,
+        messages: list,
+        token_count: int = None,
+        reason: str = 'manual',
+        summary: str = None,
+    ) -> Optional[int]:
+        """Create a session checkpoint and retain only the 10 most recent."""
+        checkpoint_data = json.dumps(messages)
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT INTO session_checkpoints
+                   (session_id, checkpoint_data, token_count, reason, summary)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, checkpoint_data, token_count, reason, summary),
+            )
+            checkpoint_id = cursor.lastrowid
+            conn.execute(
+                """DELETE FROM session_checkpoints
+                   WHERE session_id = ? AND id NOT IN (
+                       SELECT id FROM session_checkpoints
+                       WHERE session_id = ?
+                       ORDER BY created_at DESC, id DESC
+                       LIMIT 10
+                   )""",
+                (session_id, session_id),
+            )
+            return checkpoint_id
+
+        try:
+            return self._execute_write(_do)
+        except Exception:
+            logger.exception("Failed to create checkpoint for session %s", session_id)
+            return None
+
+    def list_checkpoints(self, session_id: str) -> List[Dict[str, Any]]:
+        """List checkpoint metadata for a session, newest first."""
+        with self._lock:
+            cursor = self._conn.execute(
+                """SELECT id, session_id, token_count, reason, summary, created_at
+                   FROM session_checkpoints
+                   WHERE session_id = ?
+                   ORDER BY created_at DESC, id DESC""",
+                (session_id,),
+            )
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def get_checkpoint(self, checkpoint_id: int) -> Optional[Dict[str, Any]]:
+        """Load a checkpoint and parse its stored message JSON."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM session_checkpoints WHERE id = ?",
+                (checkpoint_id,),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+
+        checkpoint = dict(row)
+        try:
+            checkpoint["checkpoint_data"] = json.loads(checkpoint["checkpoint_data"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return checkpoint
+
+    def delete_checkpoint(self, checkpoint_id: int) -> bool:
+        """Delete a checkpoint by ID."""
+        def _do(conn):
+            cursor = conn.execute(
+                "DELETE FROM session_checkpoints WHERE id = ?",
+                (checkpoint_id,),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do) > 0
 
     # =========================================================================
     # Search

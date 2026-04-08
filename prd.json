@@ -62,7 +62,7 @@
         "Max 10 checkpoints per session enforced in create_checkpoint",
         "Project passes python -m py_compile hermes_state.py"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": 5,
