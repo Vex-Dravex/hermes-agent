@@ -31,7 +31,7 @@
         "Rate limiting and body size limits are applied",
         "Project passes python -m py_compile gateway/platforms/webhook.py"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": 3,
