@@ -4253,6 +4253,18 @@ class HermesCLI:
             _cprint(f"  ✅ Restored checkpoint #{checkpoint_id} ({len(restored_messages)} messages)")
             _cprint(f"  Session rolled back to: {cp.get('summary', cp['reason'])}")
 
+    def _handle_memhealth(self):
+        """Handle /memhealth — scan memory for contradictions and staleness."""
+        try:
+            from tools.memory_health import run_health_scan
+            _cprint("  Scanning memory for contradictions and staleness...")
+            report = run_health_scan()
+            _cprint(report[:2000])
+            if len(report) > 2000:
+                _cprint(f"\n  ... (report truncated — full report saved to memory_health_report.md)")
+        except Exception as e:
+            _cprint(f"  Failed to run memory health scan: {e}")
+
     def save_conversation(self):
         """Save the current conversation to a file."""
         if not self.conversation_history:
@@ -5103,6 +5115,8 @@ class HermesCLI:
             self._handle_checkpoint_command()
         elif canonical == "restore":
             self._handle_restore_command(cmd_original)
+        elif canonical == "memhealth":
+            self._handle_memhealth()
         elif canonical == "branch":
             self._handle_branch_command(cmd_original)
         elif canonical == "save":

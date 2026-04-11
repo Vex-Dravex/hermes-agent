@@ -157,6 +157,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="<path>"),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info",
                gateway_only=True),
+    CommandDef("memhealth", "Scan memory for contradictions and staleness", "Info"),
 
     # Exit
     CommandDef("quit", "Exit the CLI", "Exit",

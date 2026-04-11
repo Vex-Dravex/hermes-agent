@@ -2221,6 +2221,11 @@ class GatewayRunner:
         # are system-generated and must skip user authorization.
         if getattr(event, "internal", False):
             pass
+        # Synthetic events with no user identity (e.g. notify_on_complete callbacks)
+        # are system-generated — skip auth check.
+        elif (getattr(event, 'is_synthetic', False) or
+              (source.user_id is None and source.user_name is None)):
+            pass
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
@@ -2592,6 +2597,9 @@ class GatewayRunner:
 
         if canonical == "rollback":
             return await self._handle_rollback_command(event)
+
+        if canonical == "memhealth":
+            return await self._handle_memhealth_command(event)
 
         if canonical == "background":
             return await self._handle_background_command(event)
@@ -5026,6 +5034,15 @@ class GatewayRunner:
                 f"A pre-rollback snapshot was saved automatically."
             )
         return f"❌ {result['error']}"
+
+    async def _handle_memhealth_command(self, event: MessageEvent) -> str:
+        """Handle /memhealth — scan memory for contradictions and staleness."""
+        try:
+            from tools.memory_health import run_health_scan
+            report = run_health_scan()
+            return report[:3000] + ("\n\n_(report truncated — full report saved to memory_health_report.md)_" if len(report) > 3000 else "")
+        except Exception as e:
+            return f"Failed to run memory health scan: {e}"
 
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /background <prompt> — run a prompt in a separate background session.
