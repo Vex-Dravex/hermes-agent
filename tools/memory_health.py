@@ -39,7 +39,12 @@ USES_PATTERN = re.compile(
 
 class MemoryHealthScanner:
     def __init__(self):
-        self.memory_dir = get_hermes_home() / 'memory'
+        # Catalyst fix 2026-04-11: real path is 'memories' (plural) not 'memory'.
+        # Original PRD story had the wrong path; Codex implemented the spec exactly,
+        # so validation.sh passed but the scanner scanned a non-existent directory.
+        # Prefer 'memories/' if it exists, fall back to 'memory/' for forward-compat.
+        base = get_hermes_home()
+        self.memory_dir = (base / 'memories') if (base / 'memories').exists() else (base / 'memory')
 
     def scan(self) -> Dict[str, Any]:
         memory_entries = self._load_entries("MEMORY.md")
