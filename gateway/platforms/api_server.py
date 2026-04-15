@@ -612,6 +612,18 @@ class APIServerAdapter(BasePlatformAdapter):
             ],
         })
 
+    async def _handle_commands(self, request: "web.Request") -> "web.Response":
+        """GET /v1/commands — return all registered commands as JSON."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from hermes_cli.commands import commands_payload
+        return web.json_response({
+            "object": "list",
+            "data": commands_payload(),
+        })
+
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         auth_err = self._check_auth(request)
@@ -2317,6 +2329,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
+            self._app.router.add_get("/v1/commands", self._handle_commands)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)

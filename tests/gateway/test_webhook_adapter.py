@@ -69,8 +69,23 @@ def _create_app(adapter: WebhookAdapter) -> web.Application:
     """Build the aiohttp Application from the adapter (without starting a full server)."""
     app = web.Application()
     app.router.add_get("/health", adapter._handle_health)
+    app.router.add_post("/webhooks/_api", adapter._handle_action_api)
     app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
     return app
+
+
+def _make_api_config(api_secret="test-api-secret", **kwargs):
+    """Build a PlatformConfig with an api_secret for _api endpoint tests."""
+    extra = {
+        "host": "0.0.0.0",
+        "port": 0,
+        "routes": {},
+        "rate_limit": kwargs.pop("rate_limit", 30),
+        "max_body_bytes": kwargs.pop("max_body_bytes", 1_048_576),
+        "api_secret": api_secret,
+    }
+    extra.update(kwargs)
+    return PlatformConfig(enabled=True, extra=extra)
 
 
 def _mock_request(headers=None, body=b"", content_length=None, match_info=None):
@@ -758,3 +773,264 @@ class TestDeliverCrossPlatformThreadId:
         mock_target.send.assert_awaited_once_with(
             "12345", "hello", metadata=None
         )
+
+
+# ===================================================================
+# POST /webhooks/_api — action endpoint
+# ===================================================================
+
+
+class TestActionApi:
+    """Tests for the POST /webhooks/_api endpoint."""
+
+    # ── Auth ──────────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_no_api_secret_returns_403(self):
+        """When api_secret is not configured, the endpoint returns 403."""
+        adapter = _make_adapter()  # no api_secret
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/_api",
+                json={"action": "run_prompt", "prompt": "hello"},
+                headers={"Authorization": "Bearer some-token"},
+            )
+            assert resp.status == 403
+            data = await resp.json()
+            assert "not configured" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_missing_auth_header_returns_401(self):
+        """No Authorization header → 401."""
+        adapter = WebhookAdapter(_make_api_config())
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/_api",
+                json={"action": "run_prompt", "prompt": "hello"},
+            )
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_wrong_token_returns_401(self):
+        """Wrong Bearer token → 401."""
+        adapter = WebhookAdapter(_make_api_config(api_secret="correct-secret"))
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/_api",
+                json={"action": "run_prompt", "prompt": "hello"},
+                headers={"Authorization": "Bearer wrong-secret"},
+            )
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_non_bearer_scheme_returns_401(self):
+        """Basic auth scheme instead of Bearer → 401."""
+        adapter = WebhookAdapter(_make_api_config())
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/_api",
+                json={"action": "run_prompt", "prompt": "hello"},
+                headers={"Authorization": "Basic test-api-secret"},
+            )
+            assert resp.status == 401
+
+    # ── Body validation ───────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_returns_400(self):
+        """Non-JSON body → 400."""
+        adapter = WebhookAdapter(_make_api_config())
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/_api",
+                data=b"not-json",
+                headers={
+                    "Authorization": "Bearer test-api-secret",
+                    "Content-Type": "application/json",
+                },
+            )
+            assert resp.status == 400
+            data = await resp.json()
+            assert "Invalid JSON" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_oversized_body_returns_413(self):
+        """Content-Length exceeding max_body_bytes → 413 before reading body."""
+        adapter = WebhookAdapter(_make_api_config(max_body_bytes=100))
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/_api",
+                json={"action": "run_prompt", "prompt": "hello"},
+                headers={
+                    "Authorization": "Bearer test-api-secret",
+                    "Content-Length": "99999",
+                },
+            )
+            assert resp.status == 413
+
+    @pytest.mark.asyncio
+    async def test_missing_action_returns_400(self):
+        """Body without 'action' field → 400."""
+        adapter = WebhookAdapter(_make_api_config())
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/_api",
+                json={"prompt": "hello"},
+                headers={"Authorization": "Bearer test-api-secret"},
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_unknown_action_returns_400(self):
+        """An unrecognised action name → 400."""
+        adapter = WebhookAdapter(_make_api_config())
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/_api",
+                json={"action": "send_message", "message": "hi"},
+                headers={"Authorization": "Bearer test-api-secret"},
+            )
+            assert resp.status == 400
+
+    # ── run_prompt ────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_run_prompt_accepted(self):
+        """Valid run_prompt request → 202 with status=accepted."""
+        adapter = WebhookAdapter(_make_api_config())
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/_api",
+                json={"action": "run_prompt", "prompt": "Summarise the project"},
+                headers={"Authorization": "Bearer test-api-secret"},
+            )
+            assert resp.status == 202
+            data = await resp.json()
+            assert data["status"] == "accepted"
+            assert data["action"] == "run_prompt"
+
+    @pytest.mark.asyncio
+    async def test_run_prompt_missing_prompt_returns_400(self):
+        """run_prompt with no 'prompt' field → 400."""
+        adapter = WebhookAdapter(_make_api_config())
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/_api",
+                json={"action": "run_prompt"},
+                headers={"Authorization": "Bearer test-api-secret"},
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_run_prompt_dispatches_message_event(self):
+        """run_prompt triggers handle_message with the supplied prompt text."""
+        adapter = WebhookAdapter(_make_api_config())
+        captured: list = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        adapter.handle_message = _capture
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/_api",
+                json={"action": "run_prompt", "prompt": "Hello from API"},
+                headers={"Authorization": "Bearer test-api-secret"},
+            )
+            assert resp.status == 202
+
+        await asyncio.sleep(0.05)
+        assert len(captured) == 1
+        assert captured[0].text == "Hello from API"
+        assert captured[0].source.chat_id.startswith("webhook:_api:")
+
+    # ── trigger_cron ──────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_trigger_cron_accepted(self):
+        """Valid trigger_cron request → 200 with status=triggered."""
+        adapter = WebhookAdapter(_make_api_config())
+        app = _create_app(adapter)
+
+        fake_job = {"id": "job-abc", "state": "scheduled"}
+        with patch("cron.jobs.trigger_job", return_value=fake_job) as mock_trigger:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/_api",
+                    json={"action": "trigger_cron", "job_id": "job-abc"},
+                    headers={"Authorization": "Bearer test-api-secret"},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["status"] == "triggered"
+                assert data["job_id"] == "job-abc"
+            mock_trigger.assert_called_once_with("job-abc")
+
+    @pytest.mark.asyncio
+    async def test_trigger_cron_missing_job_id_returns_400(self):
+        """trigger_cron without job_id → 400."""
+        adapter = WebhookAdapter(_make_api_config())
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/_api",
+                json={"action": "trigger_cron"},
+                headers={"Authorization": "Bearer test-api-secret"},
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_trigger_cron_unknown_job_returns_404(self):
+        """trigger_cron for a job_id that doesn't exist → 404."""
+        adapter = WebhookAdapter(_make_api_config())
+        app = _create_app(adapter)
+
+        with patch("cron.jobs.trigger_job", return_value=None):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/_api",
+                    json={"action": "trigger_cron", "job_id": "no-such-job"},
+                    headers={"Authorization": "Bearer test-api-secret"},
+                )
+                assert resp.status == 404
+
+    # ── Rate limiting ─────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_api_rate_limit_uses_separate_bucket(self):
+        """The _api bucket is independent from per-route webhook buckets."""
+        adapter = WebhookAdapter(_make_api_config(rate_limit=2))
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"Authorization": "Bearer test-api-secret"}
+            for _ in range(2):
+                resp = await cli.post(
+                    "/webhooks/_api",
+                    json={"action": "run_prompt", "prompt": "hi"},
+                    headers=headers,
+                )
+                assert resp.status == 202
+
+            # Third should be rate-limited
+            resp = await cli.post(
+                "/webhooks/_api",
+                json={"action": "run_prompt", "prompt": "hi"},
+                headers=headers,
+            )
+            assert resp.status == 429
+            # Webhook route bucket must be untouched
+            assert "_api" in adapter._rate_counts
+            assert "some_route" not in adapter._rate_counts

@@ -146,6 +146,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Info
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",
                gateway_only=True, args_hint="[page]"),
+    CommandDef("commands.list", "List all commands as machine-readable JSON", "Info",
+               gateway_only=True),
     CommandDef("help", "Show available commands", "Info"),
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True),
@@ -315,6 +317,28 @@ def gateway_help_lines() -> list[str]:
         alias_note = f" (alias: {', '.join(alias_parts)})" if alias_parts else ""
         lines.append(f"`/{cmd.name}{args}` -- {cmd.description}{alias_note}")
     return lines
+
+
+def commands_payload() -> list[dict]:
+    """Serialize COMMAND_REGISTRY into a JSON-safe list of dicts.
+
+    Each entry contains all fields of the corresponding ``CommandDef``
+    with tuple fields converted to lists so the result can be passed
+    directly to ``json.dumps`` or ``web.json_response``.
+    """
+    return [
+        {
+            "name": cmd.name,
+            "description": cmd.description,
+            "category": cmd.category,
+            "aliases": list(cmd.aliases),
+            "args_hint": cmd.args_hint,
+            "subcommands": list(cmd.subcommands),
+            "cli_only": cmd.cli_only,
+            "gateway_only": cmd.gateway_only,
+        }
+        for cmd in COMMAND_REGISTRY
+    ]
 
 
 def telegram_bot_commands() -> list[tuple[str, str]]:

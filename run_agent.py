@@ -6954,19 +6954,25 @@ class AIAgent:
             )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
-            from tools.memory_tool import memory_tool as _memory_tool
+            action = function_args.get("action")
+            from tools.memory_tool import memory_tool as _memory_tool, was_mutation_successful
             result = _memory_tool(
-                action=function_args.get("action"),
+                action=action,
                 target=target,
                 content=function_args.get("content"),
                 old_text=function_args.get("old_text"),
                 store=self._memory_store,
             )
+            # Invalidate cached system prompt after a successful mutation so the
+            # updated MEMORY.md / USER.md is visible on the next turn.
+            if action in ("add", "replace", "remove") and self._memory_store and was_mutation_successful(result):
+                self._memory_store.refresh_snapshot()
+                self._cached_system_prompt = None
             # Bridge: notify external memory provider of built-in memory writes
-            if self._memory_manager and function_args.get("action") in ("add", "replace"):
+            if self._memory_manager and action in ("add", "replace"):
                 try:
                     self._memory_manager.on_memory_write(
-                        function_args.get("action", ""),
+                        action or "",
                         target,
                         function_args.get("content", ""),
                     )
@@ -7376,14 +7382,20 @@ class AIAgent:
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
                 target = function_args.get("target", "memory")
-                from tools.memory_tool import memory_tool as _memory_tool
+                action = function_args.get("action")
+                from tools.memory_tool import memory_tool as _memory_tool, was_mutation_successful
                 function_result = _memory_tool(
-                    action=function_args.get("action"),
+                    action=action,
                     target=target,
                     content=function_args.get("content"),
                     old_text=function_args.get("old_text"),
                     store=self._memory_store,
                 )
+                # Invalidate cached system prompt after a successful mutation so the
+                # updated MEMORY.md / USER.md is visible on the next turn.
+                if action in ("add", "replace", "remove") and self._memory_store and was_mutation_successful(function_result):
+                    self._memory_store.refresh_snapshot()
+                    self._cached_system_prompt = None
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")

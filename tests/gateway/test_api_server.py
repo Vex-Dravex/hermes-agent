@@ -223,6 +223,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
+    app.router.add_get("/v1/commands", adapter._handle_commands)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -2091,3 +2092,74 @@ class TestSessionIdHeader:
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
+
+
+# ---------------------------------------------------------------------------
+# /v1/commands endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestCommandsEndpoint:
+    @pytest.mark.asyncio
+    async def test_commands_returns_list_envelope(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/commands")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "list"
+            assert isinstance(data["data"], list)
+            assert len(data["data"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_commands_entries_have_required_fields(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/commands")
+            assert resp.status == 200
+            data = await resp.json()
+            required = {"name", "description", "category", "aliases", "args_hint", "subcommands", "cli_only", "gateway_only"}
+            for entry in data["data"]:
+                assert required <= entry.keys(), f"Entry missing keys: {entry.get('name')}"
+
+    @pytest.mark.asyncio
+    async def test_commands_payload_is_json_serializable(self, adapter):
+        """Endpoint must return valid JSON (aiohttp would raise if not)."""
+        import json
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/commands")
+            assert resp.status == 200
+            raw_text = await resp.text()
+            # Must deserialize cleanly
+            json.loads(raw_text)
+
+    @pytest.mark.asyncio
+    async def test_commands_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/commands")
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_commands_with_valid_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/commands",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "list"
+
+    @pytest.mark.asyncio
+    async def test_commands_includes_commands_list_entry(self, adapter):
+        """The commands.list gateway command must appear in the payload."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/commands")
+            assert resp.status == 200
+            data = await resp.json()
+            names = {entry["name"] for entry in data["data"]}
+            assert "commands.list" in names

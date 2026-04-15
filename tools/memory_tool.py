@@ -369,6 +369,23 @@ class MemoryStore:
         block = self._system_prompt_snapshot.get(target, "")
         return block if block else None
 
+    def refresh_snapshot(self) -> None:
+        """
+        Refresh the frozen system-prompt snapshot from the current live state.
+
+        Normally the snapshot is fixed at load_from_disk() time so the system
+        prompt stays stable across all turns (preserving the prefix cache).
+        Call this after a successful built-in memory mutation (add/replace/remove)
+        to make the change visible in the system prompt on the *next* turn, then
+        set ``_cached_system_prompt = None`` on the agent so it rebuilds.
+
+        No disk I/O: rebuilds from the already-updated in-memory entries.
+        """
+        self._system_prompt_snapshot = {
+            "memory": self._render_block("memory", self.memory_entries),
+            "user": self._render_block("user", self.user_entries),
+        }
+
     # -- Internal helpers --
 
     def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
@@ -458,6 +475,19 @@ class MemoryStore:
                 raise
         except (OSError, IOError) as e:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
+
+
+def was_mutation_successful(result_json: str) -> bool:
+    """Return True if a memory tool mutation result JSON indicates success.
+
+    Used by the agent runner to decide whether to invalidate the cached system
+    prompt after a memory write so the updated entries are visible next turn.
+    Safe to call with any string — returns False on bad/missing JSON.
+    """
+    try:
+        return bool(json.loads(result_json).get("success", False))
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return False
 
 
 def memory_tool(

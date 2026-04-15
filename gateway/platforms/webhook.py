@@ -69,6 +69,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._host: str = config.extra.get("host", DEFAULT_HOST)
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
         self._global_secret: str = config.extra.get("secret", "")
+        self._api_secret: str = config.extra.get("api_secret", "")
         self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
@@ -124,6 +125,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
         app = web.Application()
         app.router.add_get("/health", self._handle_health)
+        app.router.add_post("/webhooks/_api", self._handle_action_api)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
 
         # Port conflict detection — fail fast if port is already in use
@@ -241,6 +243,150 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
+
+    async def _handle_action_api(self, request: "web.Request") -> "web.Response":
+        """POST /webhooks/_api — action-based API endpoint protected by Bearer auth.
+
+        Requires WEBHOOK_API_SECRET to be configured.  Supported actions:
+          run_prompt  — dispatch an agent run with a caller-supplied prompt
+          trigger_cron — schedule a cron job to run on the next scheduler tick
+        """
+        # ── Auth ─────────────────────────────────────────────────────────
+        if not self._api_secret:
+            return web.json_response(
+                {"error": "API endpoint not configured"}, status=403
+            )
+
+        auth_header = request.headers.get("Authorization", "")
+        token = ""
+        if auth_header:
+            scheme, _, token = auth_header.partition(" ")
+            if scheme.lower() != "bearer":
+                token = ""
+        if not token or not hmac.compare_digest(token, self._api_secret):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+
+        # ── Body size ─────────────────────────────────────────────────────
+        content_length = request.content_length or 0
+        if content_length > self._max_body_bytes:
+            return web.json_response({"error": "Payload too large"}, status=413)
+
+        # ── Rate limiting ─────────────────────────────────────────────────
+        now = time.time()
+        window = self._rate_counts.setdefault("_api", [])
+        window[:] = [t for t in window if now - t < 60]
+        if len(window) >= self._rate_limit:
+            return web.json_response({"error": "Rate limit exceeded"}, status=429)
+        window.append(now)
+
+        # ── Parse body ────────────────────────────────────────────────────
+        try:
+            raw_body = await request.read()
+            body = json.loads(raw_body)
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+        except (json.JSONDecodeError, ValueError):
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+        action = body.get("action", "")
+        if not action:
+            return web.json_response(
+                {"error": "Missing required field: action"}, status=400
+            )
+
+        # ── Action dispatch ───────────────────────────────────────────────
+
+        if action == "run_prompt":
+            prompt = body.get("prompt")
+            if not prompt:
+                return web.json_response(
+                    {"error": "Missing required field: prompt"}, status=400
+                )
+            deliver = body.get("deliver", "log")
+            skills = body.get("skills", [])
+
+            # Inject skill content if requested (same pattern as _handle_webhook)
+            if skills:
+                try:
+                    from agent.skill_commands import (
+                        build_skill_invocation_message,
+                        get_skill_commands,
+                    )
+
+                    skill_cmds = get_skill_commands()
+                    for skill_name in skills:
+                        cmd_key = f"/{skill_name}"
+                        if cmd_key in skill_cmds:
+                            skill_content = build_skill_invocation_message(
+                                cmd_key, user_instruction=prompt
+                            )
+                            if skill_content:
+                                prompt = skill_content
+                                break
+                        else:
+                            logger.warning(
+                                "[webhook/_api] Skill '%s' not found", skill_name
+                            )
+                except Exception as e:
+                    logger.warning("[webhook/_api] Skill loading failed: %s", e)
+
+            session_chat_id = f"webhook:_api:{int(time.time() * 1000)}"
+            self._delivery_info[session_chat_id] = {
+                "deliver": deliver,
+                "deliver_extra": {},
+                "payload": body,
+            }
+            self._delivery_info_created[session_chat_id] = now
+            self._prune_delivery_info(now)
+
+            source = self.build_source(
+                chat_id=session_chat_id,
+                chat_name="webhook/_api",
+                chat_type="webhook",
+                user_id="webhook:_api",
+                user_name="_api",
+            )
+            event = MessageEvent(
+                text=prompt,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=body,
+                message_id=session_chat_id,
+            )
+
+            task = asyncio.create_task(self.handle_message(event))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+            return web.json_response(
+                {"status": "accepted", "action": "run_prompt"}, status=202
+            )
+
+        elif action == "trigger_cron":
+            job_id = body.get("job_id")
+            if not job_id:
+                return web.json_response(
+                    {"error": "Missing required field: job_id"}, status=400
+                )
+            try:
+                from cron.jobs import trigger_job
+
+                result = trigger_job(job_id)
+                if result is None:
+                    return web.json_response(
+                        {"error": f"Job not found: {job_id}"}, status=404
+                    )
+            except Exception as e:
+                logger.error("[webhook/_api] trigger_cron failed: %s", e)
+                return web.json_response(
+                    {"error": "Failed to trigger cron job"}, status=500
+                )
+            return web.json_response({"status": "triggered", "job_id": job_id})
+
+        else:
+            return web.json_response(
+                {"error": f"Unknown action: {action}"}, status=400
+            )
 
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""

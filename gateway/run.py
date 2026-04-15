@@ -2953,7 +2953,10 @@ class GatewayRunner:
 
         if canonical == "commands":
             return await self._handle_commands_command(event)
-        
+
+        if canonical == "commands.list":
+            return await self._handle_commands_list_command(event)
+
         if canonical == "profile":
             return await self._handle_profile_command(event)
 
@@ -4563,7 +4566,13 @@ class GatewayRunner:
         if page != requested_page:
             lines.append(f"_(Requested page {requested_page} was out of range, showing page {page}.)_")
         return "\n".join(lines)
-    
+
+    async def _handle_commands_list_command(self, event: MessageEvent) -> str:
+        """Handle /commands.list — return all commands as machine-readable JSON."""
+        import json
+        from hermes_cli.commands import commands_payload
+        return "```json\n" + json.dumps({"object": "list", "data": commands_payload()}, indent=2) + "\n```"
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
 

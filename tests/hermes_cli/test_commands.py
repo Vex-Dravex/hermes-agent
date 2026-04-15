@@ -3,6 +3,8 @@
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
+import json
+
 from hermes_cli.commands import (
     COMMAND_REGISTRY,
     COMMANDS,
@@ -17,6 +19,7 @@ from hermes_cli.commands import (
     _clamp_command_names,
     _clamp_telegram_names,
     _sanitize_telegram_name,
+    commands_payload,
     discord_skill_commands,
     gateway_help_lines,
     resolve_command,
@@ -557,6 +560,56 @@ class TestGhostText:
 
     def test_no_suggestion_for_non_slash(self):
         assert _suggestion("hello") is None
+
+
+# ---------------------------------------------------------------------------
+# commands_payload helper
+# ---------------------------------------------------------------------------
+
+
+class TestCommandsPayload:
+    def test_returns_list(self):
+        payload = commands_payload()
+        assert isinstance(payload, list)
+
+    def test_length_matches_registry(self):
+        assert len(commands_payload()) == len(COMMAND_REGISTRY)
+
+    def test_every_entry_has_required_keys(self):
+        required = {"name", "description", "category", "aliases", "args_hint", "subcommands", "cli_only", "gateway_only"}
+        for entry in commands_payload():
+            assert required <= entry.keys(), f"Missing keys in entry for '{entry.get('name')}'"
+
+    def test_aliases_and_subcommands_are_lists(self):
+        for entry in commands_payload():
+            assert isinstance(entry["aliases"], list), f"aliases for '{entry['name']}' should be a list"
+            assert isinstance(entry["subcommands"], list), f"subcommands for '{entry['name']}' should be a list"
+
+    def test_is_json_serializable(self):
+        """The entire payload must round-trip through json.dumps without error."""
+        raw = commands_payload()
+        serialized = json.dumps(raw)
+        restored = json.loads(serialized)
+        assert len(restored) == len(raw)
+
+    def test_known_command_present(self):
+        names = {entry["name"] for entry in commands_payload()}
+        assert "help" in names
+        assert "commands.list" in names
+
+    def test_background_aliases_preserved(self):
+        entry = next(e for e in commands_payload() if e["name"] == "background")
+        assert "bg" in entry["aliases"]
+
+    def test_reasoning_subcommands_preserved(self):
+        entry = next(e for e in commands_payload() if e["name"] == "reasoning")
+        assert "high" in entry["subcommands"]
+        assert "show" in entry["subcommands"]
+
+    def test_commands_list_is_gateway_only(self):
+        entry = next(e for e in commands_payload() if e["name"] == "commands.list")
+        assert entry["gateway_only"] is True
+        assert entry["cli_only"] is False
 
 
 # ---------------------------------------------------------------------------
