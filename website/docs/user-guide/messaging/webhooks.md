@@ -40,6 +40,7 @@ Add to `~/.hermes/.env`:
 WEBHOOK_ENABLED=true
 WEBHOOK_PORT=8644        # default
 WEBHOOK_SECRET=your-global-secret
+WEBHOOK_API_SECRET=your-action-api-bearer-token
 ```
 
 ### Verify the server
@@ -55,6 +56,48 @@ Expected response:
 ```json
 {"status": "ok", "platform": "webhook"}
 ```
+
+### Action API (`POST /webhooks/_api`)
+
+Hermes also exposes a small authenticated action endpoint for trusted automation that needs to trigger agent work directly instead of sending a third-party webhook payload.
+
+**Auth:**
+- Configure `WEBHOOK_API_SECRET`
+- Send `Authorization: Bearer <WEBHOOK_API_SECRET>`
+
+**Supported actions:**
+- `run_prompt` — queue a Hermes run from a raw prompt
+- `trigger_cron` — trigger an existing cron job by `job_id`
+
+Example `run_prompt` request:
+
+```bash
+curl -X POST http://localhost:8644/webhooks/_api \
+  -H "Authorization: Bearer $WEBHOOK_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "run_prompt",
+    "prompt": "Summarize the latest gateway health and post the result to log",
+    "deliver": "log"
+  }'
+```
+
+Example `trigger_cron` request:
+
+```bash
+curl -X POST http://localhost:8644/webhooks/_api \
+  -H "Authorization: Bearer $WEBHOOK_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "trigger_cron",
+    "job_id": "your-cron-job-id"
+  }'
+```
+
+Notes:
+- The action API reuses the webhook adapter's existing body-size and rate-limit protections.
+- If `WEBHOOK_API_SECRET` is unset, the endpoint returns `403`.
+- If the Bearer token is missing or wrong, the endpoint returns `401`.
 
 ---
 

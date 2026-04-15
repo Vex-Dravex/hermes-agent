@@ -181,6 +181,16 @@ class TestLoadGatewayConfig:
 
         assert config.thread_sessions_per_user is True
 
+    def test_webhook_api_secret_env_override(self, monkeypatch):
+        monkeypatch.setenv("WEBHOOK_ENABLED", "true")
+        monkeypatch.setenv("WEBHOOK_API_SECRET", "unit-test-secret")
+
+        config = load_gateway_config()
+
+        assert Platform.WEBHOOK in config.platforms
+        assert config.platforms[Platform.WEBHOOK].enabled is True
+        assert config.platforms[Platform.WEBHOOK].extra["api_secret"] == "unit-test-secret"
+
     def test_thread_sessions_per_user_defaults_to_false(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

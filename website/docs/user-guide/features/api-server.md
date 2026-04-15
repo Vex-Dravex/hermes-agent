@@ -156,6 +156,32 @@ Delete a stored response.
 
 Lists the agent as an available model. The advertised model name defaults to the [profile](/docs/user-guide/features/profiles) name (or `hermes-agent` for the default profile). Required by most frontends for model discovery.
 
+### GET /v1/commands
+
+Returns the machine-readable Hermes command registry for operator clients and dashboards. This is useful when you want to discover available slash commands, aliases, categories, and argument hints without scraping `/help` output.
+
+**Response shape:**
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "name": "commands.list",
+      "description": "List all commands as machine-readable JSON",
+      "category": "Info",
+      "aliases": [],
+      "args_hint": "",
+      "subcommands": [],
+      "cli_only": false,
+      "gateway_only": true,
+      "gateway_config_gate": null
+    }
+  ]
+}
+```
+
+Like the rest of the API server, this endpoint uses Bearer auth via `API_SERVER_KEY`.
+
 ### GET /health
 
 Health check. Returns `{"status": "ok"}`. Also available at **GET /v1/health** for OpenAI-compatible clients that expect the `/v1/` prefix.

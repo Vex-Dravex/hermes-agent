@@ -146,6 +146,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/reload` | Reload `.env` variables into the running session. |
 | `/yolo` | Toggle YOLO mode — skip all dangerous command approval prompts. |
 | `/commands [page]` | Browse all commands and skills (paginated). |
+| `/commands.list` | Return the machine-readable JSON command registry for operator clients. |
 | `/approve [session\|always]` | Approve and execute a pending dangerous command. `session` approves for this session only; `always` adds to permanent allowlist. |
 | `/deny` | Reject a pending dangerous command. |
 | `/update` | Update Hermes Agent to the latest version. |
