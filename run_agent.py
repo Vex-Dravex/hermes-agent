@@ -3245,8 +3245,13 @@ class AIAgent:
                 if user_block:
                     prompt_parts.append(user_block)
 
-        # External memory provider system prompt block (additive to built-in)
-        if self._memory_manager:
+        # External memory provider system prompt block (additive to built-in).
+        # When live_refresh=True these blocks are deferred to the live block
+        # assembled at each API call (via _build_live_memory_block → manager
+        # .live_memory_block), so we skip them here to prevent duplication.
+        # live_refresh does NOT affect external provider prefetch cadence —
+        # background prefetch runs on its own schedule regardless of this gate.
+        if self._memory_manager and not self._memory_live_refresh:
             try:
                 _ext_mem_block = self._memory_manager.build_system_prompt()
                 if _ext_mem_block:
@@ -3323,15 +3328,24 @@ class AIAgent:
         Render the current live memory blocks for API-call-time injection.
 
         Called just before the system message is assembled for each API call
-        when live_refresh is True.  Reading directly from the live entry lists
-        means mid-session tool writes are immediately visible on the next call
-        without touching _cached_system_prompt or rebuilding the full prompt.
+        when live_refresh is True.  Delegates to MemoryManager.live_memory_block
+        which assembles built-in live snapshots (reflecting mid-session writes
+        immediately) plus any external provider system_prompt_block() content,
+        all with per-source failure isolation.
 
         Returns an empty string when live_refresh is False (memory is already
-        baked into the cached prompt) or when there is no memory store / no
-        entries to inject.
+        baked into the cached prompt) or when there is no manager.
         """
-        if not self._memory_live_refresh or not self._memory_store:
+        if not self._memory_live_refresh:
+            return ""
+        if self._memory_manager:
+            return self._memory_manager.live_memory_block(
+                self._memory_store,
+                self._memory_enabled,
+                self._user_profile_enabled,
+            )
+        # Fallback: no manager attached (unusual path, e.g. stripped test harness).
+        if not self._memory_store:
             return ""
         blocks = []
         if self._memory_enabled:

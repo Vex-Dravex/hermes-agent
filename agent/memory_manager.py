@@ -140,6 +140,72 @@ class MemoryManager:
                 return p
         return None
 
+    # -- Live memory block (API-call-time injection) -------------------------
+
+    def live_memory_block(
+        self,
+        memory_store,  # tools.memory_tool.MemoryStore | None
+        memory_enabled: bool,
+        user_profile_enabled: bool,
+    ) -> str:
+        """Assemble live built-in memory blocks plus external provider
+        system_prompt_block() output into one unified block.
+
+        Designed for API-call-time injection when live_refresh is enabled.
+        Combines:
+          - Live snapshots from the built-in MemoryStore (reflect mid-session
+            writes immediately without touching the cached system prompt).
+          - Any non-builtin (external) provider system_prompt_block()
+            contributions (e.g. plugin guidance text).
+
+        Failure in any source is isolated — one failing component never blocks
+        the others.  Returns an empty string if nothing is produced.
+
+        Note: live_refresh controls when built-in memory (MEMORY.md / USER.md)
+        becomes visible to the model and when external provider system_prompt
+        blocks are injected.  It does NOT affect external provider prefetch
+        cadence — background prefetch runs on its own schedule regardless.
+        """
+        blocks: list = []
+
+        # Built-in live snapshots — reflect mid-session tool writes instantly.
+        if memory_store is not None:
+            if memory_enabled:
+                try:
+                    block = memory_store.live_snapshot("memory")
+                    if block:
+                        blocks.append(block)
+                except Exception as e:
+                    logger.warning(
+                        "live_memory_block: built-in memory snapshot failed: %s", e
+                    )
+            if user_profile_enabled:
+                try:
+                    block = memory_store.live_snapshot("user")
+                    if block:
+                        blocks.append(block)
+                except Exception as e:
+                    logger.warning(
+                        "live_memory_block: built-in user snapshot failed: %s", e
+                    )
+
+        # External provider contributions (non-builtin only; builtin's frozen
+        # snapshot is already represented by the live snapshots above).
+        for provider in self._providers:
+            if provider.name == "builtin":
+                continue
+            try:
+                block = provider.system_prompt_block()
+                if block and block.strip():
+                    blocks.append(block)
+            except Exception as e:
+                logger.warning(
+                    "Memory provider '%s' live system_prompt_block() failed: %s",
+                    provider.name, e,
+                )
+
+        return "\n\n".join(blocks)
+
     # -- System prompt -------------------------------------------------------
 
     def build_system_prompt(self) -> str:

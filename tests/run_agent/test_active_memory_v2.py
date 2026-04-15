@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.memory_manager import MemoryManager
 from run_agent import AIAgent
 from tools.memory_tool import MemoryStore
 
@@ -244,3 +245,136 @@ class TestMidSessionLiveInjection:
         store.add("memory", "new entry")
 
         assert agent._build_live_memory_block() == ""
+
+
+# ---------------------------------------------------------------------------
+# Active Memory V3 — MemoryManager.live_memory_block integration path
+# ---------------------------------------------------------------------------
+
+
+class _FakeProvider:
+    """Minimal provider stub for V3 integration tests."""
+
+    def __init__(self, name, prompt_block=""):
+        self._name = name
+        self._prompt_block = prompt_block
+        self._fail = False
+
+    @property
+    def name(self):
+        return self._name
+
+    def get_tool_schemas(self):
+        return []
+
+    def system_prompt_block(self):
+        if self._fail:
+            raise RuntimeError("provider failure")
+        return self._prompt_block
+
+
+class TestV3LiveMemoryBlockManagerDelegation:
+    """_build_live_memory_block delegates to MemoryManager.live_memory_block
+    when live_refresh=True, preserving all existing cache-aware semantics."""
+
+    def test_delegates_to_manager_live_memory_block(self, store):
+        """live_memory_block on the manager is invoked, not direct store access."""
+        store.add("memory", "manager-delegated-entry")
+        store.load_from_disk()
+
+        agent = _make_agent()
+        _attach_store(agent, store, live_refresh=True)
+
+        mgr = MemoryManager()
+        agent._memory_manager = mgr
+
+        result = agent._build_live_memory_block()
+        assert "manager-delegated-entry" in result
+
+    def test_external_provider_block_in_live_output(self, store):
+        """External provider system_prompt_block() appears in the live block."""
+        store.load_from_disk()
+
+        agent = _make_agent()
+        _attach_store(agent, store, live_refresh=True)
+
+        mgr = MemoryManager()
+        ext = _FakeProvider("ext-plugin", prompt_block="Plugin guidance text")
+        mgr.add_provider(ext)
+        agent._memory_manager = mgr
+
+        result = agent._build_live_memory_block()
+        assert "Plugin guidance text" in result
+
+    def test_external_provider_block_excluded_from_cached_prompt(self, store):
+        """When live_refresh=True, external provider blocks are NOT baked into
+        the cached system prompt (they arrive via the live block instead)."""
+        store.load_from_disk()
+
+        agent = _make_agent()
+        _attach_store(agent, store, live_refresh=True)
+
+        mgr = MemoryManager()
+        ext = _FakeProvider("ext-plugin", prompt_block="EXTERNAL GUIDANCE")
+        mgr.add_provider(ext)
+        agent._memory_manager = mgr
+
+        cached = agent._build_system_prompt()
+        assert "EXTERNAL GUIDANCE" not in cached
+
+    def test_external_provider_block_in_cached_prompt_when_live_refresh_false(self, store):
+        """When live_refresh=False, external provider blocks ARE in the cached
+        system prompt (live block is empty)."""
+        store.load_from_disk()
+
+        agent = _make_agent()
+        _attach_store(agent, store, live_refresh=False)
+
+        mgr = MemoryManager()
+        ext = _FakeProvider("ext-plugin", prompt_block="EXTERNAL GUIDANCE")
+        mgr.add_provider(ext)
+        agent._memory_manager = mgr
+
+        cached = agent._build_system_prompt()
+        assert "EXTERNAL GUIDANCE" in cached
+        assert agent._build_live_memory_block() == ""
+
+    def test_live_block_empty_when_live_refresh_false_with_manager(self, store):
+        """live_refresh=False → _build_live_memory_block returns '' even with manager."""
+        store.add("memory", "some-entry")
+        store.load_from_disk()
+
+        agent = _make_agent()
+        _attach_store(agent, store, live_refresh=False)
+        agent._memory_manager = MemoryManager()
+
+        assert agent._build_live_memory_block() == ""
+
+    def test_failing_external_provider_does_not_block_live_snapshots(self, store):
+        """A provider that throws in system_prompt_block() is isolated."""
+        store.add("memory", "builtin-entry")
+        store.load_from_disk()
+
+        agent = _make_agent()
+        _attach_store(agent, store, live_refresh=True)
+
+        mgr = MemoryManager()
+        broken = _FakeProvider("broken")
+        broken._fail = True
+        mgr.add_provider(broken)
+        agent._memory_manager = mgr
+
+        result = agent._build_live_memory_block()
+        assert "builtin-entry" in result
+
+    def test_no_manager_falls_back_to_inline_assembly(self, store):
+        """Without a manager the inline fallback path still works."""
+        store.add("memory", "fallback-entry")
+        store.load_from_disk()
+
+        agent = _make_agent()
+        _attach_store(agent, store, live_refresh=True)
+        agent._memory_manager = None  # strip the manager
+
+        result = agent._build_live_memory_block()
+        assert "fallback-entry" in result

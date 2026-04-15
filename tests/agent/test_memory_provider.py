@@ -647,6 +647,128 @@ class TestSetupFieldFiltering:
 
 
 # ---------------------------------------------------------------------------
+# MemoryManager.live_memory_block — Active Memory V3
+# ---------------------------------------------------------------------------
+
+
+class TestLiveMemoryBlock:
+    """live_memory_block() assembles built-in live snapshots plus external
+    provider system_prompt_block() output with per-source failure isolation."""
+
+    def _make_store(self, memory_entries=None, user_entries=None):
+        """Minimal MemoryStore-like stub for isolation."""
+        store = MagicMock()
+        mem_entries = memory_entries or []
+        usr_entries = user_entries or []
+        store.live_snapshot.side_effect = lambda target: (
+            "## Memory\n" + "\n".join(f"- {e}" for e in mem_entries)
+            if target == "memory" and mem_entries
+            else ("## User\n" + "\n".join(f"- {e}" for e in usr_entries)
+                  if target == "user" and usr_entries
+                  else "")
+        )
+        return store
+
+    def test_returns_empty_when_no_store_no_providers(self):
+        mgr = MemoryManager()
+        assert mgr.live_memory_block(None, True, True) == ""
+
+    def test_returns_empty_when_store_is_none(self):
+        mgr = MemoryManager()
+        ext = FakeMemoryProvider("ext")
+        ext._prompt_block = ""
+        mgr.add_provider(ext)
+        assert mgr.live_memory_block(None, True, True) == ""
+
+    def test_memory_enabled_returns_memory_snapshot(self):
+        mgr = MemoryManager()
+        store = self._make_store(memory_entries=["fact A"])
+        result = mgr.live_memory_block(store, memory_enabled=True, user_profile_enabled=False)
+        assert "fact A" in result
+        store.live_snapshot.assert_called_once_with("memory")
+
+    def test_user_enabled_returns_user_snapshot(self):
+        mgr = MemoryManager()
+        store = self._make_store(user_entries=["Name: Alice"])
+        result = mgr.live_memory_block(store, memory_enabled=False, user_profile_enabled=True)
+        assert "Name: Alice" in result
+        store.live_snapshot.assert_called_once_with("user")
+
+    def test_both_targets_combined(self):
+        mgr = MemoryManager()
+        store = self._make_store(memory_entries=["mem-note"], user_entries=["user-pref"])
+        result = mgr.live_memory_block(store, memory_enabled=True, user_profile_enabled=True)
+        assert "mem-note" in result
+        assert "user-pref" in result
+
+    def test_both_disabled_returns_empty(self):
+        mgr = MemoryManager()
+        store = self._make_store(memory_entries=["mem-note"], user_entries=["user-pref"])
+        result = mgr.live_memory_block(store, memory_enabled=False, user_profile_enabled=False)
+        assert result == ""
+
+    def test_external_provider_block_included(self):
+        """External provider system_prompt_block() is appended to the live block."""
+        mgr = MemoryManager()
+        ext = FakeMemoryProvider("honcho")
+        ext._prompt_block = "Honcho guidance text"
+        mgr.add_provider(ext)
+        store = self._make_store(memory_entries=["mem-entry"])
+        result = mgr.live_memory_block(store, memory_enabled=True, user_profile_enabled=False)
+        assert "mem-entry" in result
+        assert "Honcho guidance text" in result
+
+    def test_builtin_provider_system_prompt_block_skipped(self):
+        """Builtin provider is excluded from external provider loop to avoid
+        double-injecting the frozen snapshot."""
+        mgr = MemoryManager()
+        builtin = FakeMemoryProvider("builtin")
+        builtin._prompt_block = "FROZEN SNAPSHOT"
+        mgr.add_provider(builtin)
+        store = self._make_store(memory_entries=["live-entry"])
+        result = mgr.live_memory_block(store, memory_enabled=True, user_profile_enabled=False)
+        assert "live-entry" in result
+        assert "FROZEN SNAPSHOT" not in result
+
+    def test_external_provider_failure_isolated(self):
+        """A failing external provider does not block built-in live snapshots."""
+        mgr = MemoryManager()
+        ext = FakeMemoryProvider("broken-ext")
+        ext.system_prompt_block = MagicMock(side_effect=RuntimeError("provider down"))
+        mgr.add_provider(ext)
+        store = self._make_store(memory_entries=["safe-entry"])
+        result = mgr.live_memory_block(store, memory_enabled=True, user_profile_enabled=False)
+        assert "safe-entry" in result
+
+    def test_memory_store_snapshot_failure_isolated(self):
+        """A failing memory snapshot does not block user snapshot or providers."""
+        mgr = MemoryManager()
+        ext = FakeMemoryProvider("ext")
+        ext._prompt_block = "ext-block"
+        mgr.add_provider(ext)
+        store = MagicMock()
+        store.live_snapshot.side_effect = lambda target: (
+            (_ for _ in ()).throw(RuntimeError("disk error"))
+            if target == "memory"
+            else "## User\n- user-entry"
+        )
+        result = mgr.live_memory_block(store, memory_enabled=True, user_profile_enabled=True)
+        assert "user-entry" in result
+        assert "ext-block" in result
+
+    def test_empty_external_provider_block_skipped(self):
+        """Empty external provider blocks are not added (no blank separators)."""
+        mgr = MemoryManager()
+        ext = FakeMemoryProvider("empty-ext")
+        ext._prompt_block = ""
+        mgr.add_provider(ext)
+        store = self._make_store(memory_entries=["only-entry"])
+        result = mgr.live_memory_block(store, memory_enabled=True, user_profile_enabled=False)
+        assert result.strip() != ""
+        assert "\n\n\n" not in result  # no extra blank separators
+
+
+# ---------------------------------------------------------------------------
 # Context fencing regression tests (salvaged from PR #5339 by lance0)
 # ---------------------------------------------------------------------------
 
