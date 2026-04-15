@@ -1133,6 +1133,7 @@ class AIAgent:
         self._memory_store = None
         self._memory_enabled = False
         self._user_profile_enabled = False
+        self._memory_live_refresh = True   # inject live blocks at API-call time
         self._memory_nudge_interval = 10
         self._memory_flush_min_turns = 6
         self._turns_since_memory = 0
@@ -1142,6 +1143,7 @@ class AIAgent:
                 mem_config = _agent_cfg.get("memory", {})
                 self._memory_enabled = mem_config.get("memory_enabled", False)
                 self._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+                self._memory_live_refresh = bool(mem_config.get("live_refresh", True))
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
                 self._memory_flush_min_turns = int(mem_config.get("flush_min_turns", 6))
                 if self._memory_enabled or self._user_profile_enabled:
@@ -3227,7 +3229,12 @@ class AIAgent:
         if system_message is not None:
             prompt_parts.append(system_message)
 
-        if self._memory_store:
+        # When live_refresh is True, memory blocks are injected at API-call time
+        # from the live in-memory state (see _build_live_memory_block) so that
+        # mid-session writes are visible on the very next turn without
+        # invalidating the cached system prompt.  When live_refresh is False,
+        # bake the frozen snapshot here for backwards-compatible behaviour.
+        if self._memory_store and not self._memory_live_refresh:
             if self._memory_enabled:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
@@ -3310,6 +3317,32 @@ class AIAgent:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
 
         return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
+
+    def _build_live_memory_block(self) -> str:
+        """
+        Render the current live memory blocks for API-call-time injection.
+
+        Called just before the system message is assembled for each API call
+        when live_refresh is True.  Reading directly from the live entry lists
+        means mid-session tool writes are immediately visible on the next call
+        without touching _cached_system_prompt or rebuilding the full prompt.
+
+        Returns an empty string when live_refresh is False (memory is already
+        baked into the cached prompt) or when there is no memory store / no
+        entries to inject.
+        """
+        if not self._memory_live_refresh or not self._memory_store:
+            return ""
+        blocks = []
+        if self._memory_enabled:
+            block = self._memory_store.live_snapshot("memory")
+            if block:
+                blocks.append(block)
+        if self._user_profile_enabled:
+            block = self._memory_store.live_snapshot("user")
+            if block:
+                blocks.append(block)
+        return "\n\n".join(blocks)
 
     # =========================================================================
     # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
@@ -7679,6 +7712,11 @@ class AIAgent:
                 api_messages.append(api_msg)
 
             effective_system = self._cached_system_prompt or ""
+            # live_refresh: inject up-to-date memory blocks at call time so
+            # mid-session writes are visible without rebuilding the cached prompt.
+            _live_mem = self._build_live_memory_block()
+            if _live_mem:
+                effective_system = (effective_system + "\n\n" + _live_mem).strip()
             if self.ephemeral_system_prompt:
                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
             if effective_system:
@@ -8251,11 +8289,17 @@ class AIAgent:
                 # The signature field helps maintain reasoning continuity
                 api_messages.append(api_msg)
 
-            # Build the final system message: cached prompt + ephemeral system prompt.
-            # Ephemeral additions are API-call-time only (not persisted to session DB).
-            # External recall context is injected into the user message, not the system
+            # Build the final system message: cached prompt + live memory (when
+            # live_refresh=True) + ephemeral system prompt.  Ephemeral additions
+            # are API-call-time only (not persisted to session DB).  External
+            # recall context is injected into the user message, not the system
             # prompt, so the stable cache prefix remains unchanged.
             effective_system = active_system_prompt or ""
+            # live_refresh: inject up-to-date memory blocks at call time so
+            # mid-session writes are visible without rebuilding the cached prompt.
+            _live_mem = self._build_live_memory_block()
+            if _live_mem:
+                effective_system = (effective_system + "\n\n" + _live_mem).strip()
             if self.ephemeral_system_prompt:
                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
             # NOTE: Plugin context from pre_llm_call hooks is injected into the

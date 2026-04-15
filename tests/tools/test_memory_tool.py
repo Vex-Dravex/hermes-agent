@@ -13,6 +13,90 @@ from tools.memory_tool import (
     MEMORY_SCHEMA,
 )
 
+# =========================================================================
+# MemoryStore.live_snapshot() — live vs frozen
+# =========================================================================
+
+class TestLiveSnapshot:
+    def test_empty_store_returns_none(self, store):
+        assert store.live_snapshot("memory") is None
+        assert store.live_snapshot("user") is None
+
+    def test_reflects_entries_before_load(self, tmp_path, monkeypatch):
+        """live_snapshot uses live entries, not the frozen snapshot."""
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        s = MemoryStore(memory_char_limit=500, user_char_limit=300)
+        s.load_from_disk()  # empty start
+
+        s.add("memory", "live entry one")
+        result = s.live_snapshot("memory")
+        assert result is not None
+        assert "live entry one" in result
+
+    def test_live_snapshot_includes_mid_session_write(self, store):
+        """After add(), live_snapshot reflects the new entry immediately."""
+        store.load_from_disk()
+        store.add("memory", "written mid-session")
+
+        snap = store.live_snapshot("memory")
+        assert snap is not None
+        assert "written mid-session" in snap
+
+    def test_live_snapshot_diverges_from_frozen_after_write(self, store):
+        """live_snapshot and format_for_system_prompt diverge after a mid-session add."""
+        store.add("memory", "pre-load entry")
+        store.load_from_disk()   # frozen snapshot captures "pre-load entry"
+
+        store.add("memory", "post-load entry")
+
+        frozen = store.format_for_system_prompt("memory")
+        live = store.live_snapshot("memory")
+
+        assert frozen is not None
+        assert "pre-load entry" in frozen
+        assert "post-load entry" not in frozen   # frozen stays unchanged
+
+        assert "pre-load entry" in live
+        assert "post-load entry" in live           # live sees the new entry
+
+    def test_live_snapshot_does_not_mutate_frozen_snapshot(self, store):
+        """Calling live_snapshot must never modify _system_prompt_snapshot."""
+        store.add("memory", "initial")
+        store.load_from_disk()
+        before = dict(store._system_prompt_snapshot)
+
+        store.add("memory", "new entry")
+        store.live_snapshot("memory")   # must be a pure read
+
+        assert store._system_prompt_snapshot == before
+
+    def test_live_snapshot_user_target(self, store):
+        """live_snapshot works for the user store as well."""
+        store.add("user", "Name: Bob")
+        snap = store.live_snapshot("user")
+        assert snap is not None
+        assert "Name: Bob" in snap
+
+    def test_live_snapshot_after_remove(self, store):
+        """After remove(), live_snapshot no longer contains the deleted entry."""
+        store.add("memory", "entry to delete")
+        store.load_from_disk()
+        store.remove("memory", "entry to delete")
+
+        snap = store.live_snapshot("memory")
+        assert snap is None   # all entries gone
+
+    def test_live_snapshot_after_replace(self, store):
+        """After replace(), live_snapshot shows the new text, not the old."""
+        store.add("memory", "old text")
+        store.load_from_disk()
+        store.replace("memory", "old text", "new text")
+
+        snap = store.live_snapshot("memory")
+        assert snap is not None
+        assert "new text" in snap
+        assert "old text" not in snap
+
 
 # =========================================================================
 # Tool schema guidance

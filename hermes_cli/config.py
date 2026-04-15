@@ -588,6 +588,14 @@ DEFAULT_CONFIG = {
         "user_profile_enabled": True,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # When true (default), MEMORY.md / USER.md blocks are NOT baked into the
+        # cached system prompt at session start.  Instead they are injected from
+        # the live in-memory state just before each API call, so mid-session
+        # writes become visible on the very next turn without rebuilding the
+        # entire cached prompt.  Set to false to restore the original frozen-
+        # snapshot behaviour (memory baked in at session start, never changes
+        # until next session, maximises prefix-cache stability).
+        "live_refresh": True,
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".

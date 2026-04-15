@@ -369,6 +369,23 @@ class MemoryStore:
         block = self._system_prompt_snapshot.get(target, "")
         return block if block else None
 
+    def live_snapshot(self, target: str) -> Optional[str]:
+        """
+        Render the current live entries without touching the frozen snapshot.
+
+        Unlike format_for_system_prompt(), this always reflects the latest
+        in-memory state — including any mid-session writes — because it reads
+        directly from memory_entries / user_entries.  Used by the live_refresh
+        code path so that tool-call writes become visible on the very next API
+        call without rebuilding the whole cached system prompt.
+
+        Returns None when there are no live entries for the given target.
+        """
+        entries = self._entries_for(target)
+        if not entries:
+            return None
+        return self._render_block(target, entries)
+
     def refresh_snapshot(self) -> None:
         """
         Refresh the frozen system-prompt snapshot from the current live state.
